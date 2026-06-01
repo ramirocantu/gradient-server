@@ -132,6 +132,33 @@ async def test_first_sync_creates_page_and_pointer(db_session: AsyncSession):
 
 
 # --------------------------------------------------------------------------- #
+# 1b. RCA-33: pages.create parents to data_source_id, not database_id.
+# Notion API 2025-09-03 (notion-client>=3) 404s a database_id parent given a
+# data-source id; NOTION_WIKI_DB_ID holds a data-source id. Pin the shape so a
+# regression to the legacy {"database_id": ...} parent fails loudly here
+# instead of silently at runtime against the live API.
+# --------------------------------------------------------------------------- #
+
+
+async def test_pages_create_parents_to_data_source(db_session: AsyncSession):
+    node = await _make_course_node(db_session)
+    facts = await _make_facts(db_session, node.course_id, ["Fact long enough to keep."])
+    client = _forge_notion_client(page_id="page-ds")
+
+    await sync_node_to_notion(
+        db_session,
+        notion_client=client,
+        notion_wiki_db_id="ds-id",
+        node=node,
+        facts=facts,
+    )
+
+    _, kwargs = client.pages.create.call_args
+    assert kwargs["parent"] == {"type": "data_source_id", "data_source_id": "ds-id"}
+    assert "database_id" not in kwargs["parent"]
+
+
+# --------------------------------------------------------------------------- #
 # 2. Re-sync append-only (V-M3, V-N1)
 # --------------------------------------------------------------------------- #
 

@@ -115,7 +115,11 @@ async def _ensure_node_page(
         return pointer, False
 
     result = await notion_client.pages.create(
-        parent={"database_id": notion_wiki_db_id},
+        # Notion API 2025-09-03 (notion-client>=3): a database's rows live under
+        # a *data source*, so page creation parents to the data_source_id, not
+        # the legacy database_id (which 404s against a data-source id). The
+        # configured NOTION_WIKI_DB_ID is the data-source id.
+        parent={"type": "data_source_id", "data_source_id": notion_wiki_db_id},
         properties={
             "Name": {"title": [{"type": "text", "text": {"content": node.name}}]},
         },
