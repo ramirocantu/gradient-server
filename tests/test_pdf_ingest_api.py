@@ -64,7 +64,7 @@ async def test_pdf_ingest_happy_path(client: AsyncClient, db_session: AsyncSessi
     assert body["pages"] == 1
     assert body["new_facts"] == 1
     assert body["reused_pdf"] is False
-    assert body["extractor_version"] == "pdf-vision-v1"
+    assert body["extractor_version"] == "pdf-vision-v2"
 
 
 async def test_pdf_ingest_unknown_course_404(client: AsyncClient):
