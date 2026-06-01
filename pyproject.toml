@@ -15,8 +15,9 @@ dependencies = [
     "fastapi>=0.115",
     "httpx>=0.27",
     "jsonschema>=4.23",
-    # P2 KB substrate (V-KB2):
-    "notion-client>=2.2",
+    # P2 KB substrate (V-KB2): >=3.1 pins Notion API 2025-09-03 (data_source_id
+    # parent shape); a 2.x resolve sends the legacy database_id parent and 404s.
+    "notion-client>=3.1",
     "pdfplumber>=0.11",
     "pgvector>=0.3",
     "pydantic-settings>=2.3",

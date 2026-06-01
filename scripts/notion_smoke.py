@@ -2,9 +2,9 @@
 reaches Notion with the configured token + wiki DB.
 
 Staged so each failure is diagnosable in isolation:
-  1. users.me()                  — token valid + integration identity
-  2. databases.retrieve(db_id)   — wiki DB reachable + integration shared in
-  3. sync_node_to_notion(...)    — the real production path creates a page +
+  1. users.me()                       — token valid + integration identity
+  2. data_sources.retrieve(ds_id)     — wiki data source reachable + shared in
+  3. sync_node_to_notion(...)         — the real production path creates a page +
                                    appends fact bullets, persisting a pointer
 
 Read-only stages (1,2) run first; the write stage (3) is gated behind --write
@@ -23,6 +23,15 @@ from app.config import settings
 
 
 async def main(do_write: bool, keep: bool) -> int:
+    """Run the staged Notion connectivity check; return a process exit code.
+
+    Stages 1-2 (token + data-source reachability) are read-only and always
+    run. Stage 3 (real ``sync_node_to_notion`` write) runs only when
+    ``do_write`` is set; the created proof page is archived and its pointer
+    row dropped on exit unless ``keep`` is set. Returns 0 on success, 1 on the
+    first failed stage or any raised Notion/SDK error.
+    """
+
     if not settings.NOTION_API_TOKEN or not settings.NOTION_WIKI_DB_ID:
         print("FAIL: NOTION_API_TOKEN / NOTION_WIKI_DB_ID unset")
         return 1
@@ -39,8 +48,8 @@ async def main(do_write: bool, keep: bool) -> int:
         # Stage 2 — wiki data source reachable + shared with integration.
         # API 2025-09-03: the configured id is a data_source id, retrieved via
         # the data_sources endpoint (databases.retrieve expects a database id).
-        ds = await client.request(
-            path=f"data_sources/{settings.NOTION_WIKI_DB_ID}", method="GET"
+        ds = await client.data_sources.retrieve(
+            data_source_id=settings.NOTION_WIKI_DB_ID
         )
         title = "".join(t.get("plain_text", "") for t in ds.get("title", []))
         props = list(ds.get("properties", {}).keys())
@@ -94,7 +103,7 @@ async def main(do_write: bool, keep: bool) -> int:
             )
             if keep:
                 await session.commit()
-                print(f"[3] page KEPT (--keep) — view: {report and report.notion_page_id}")
+                print(f"[3] page KEPT (--keep) — page_id={page_id}")
                 print(f"    url: https://www.notion.so/{page_id.replace('-', '')}")
             else:
                 # Cleanup: archive the proof page AND drop the pointer row so the
