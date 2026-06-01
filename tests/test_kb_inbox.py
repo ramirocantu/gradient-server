@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.atomic_fact import AtomicFact
 from app.models.outline import Course
 from app.services.kb.inbox import poll_inbox
-from app.services.kb.pdf_ingest import RenderedPage
+from app.services.kb.pdf_ingest import EXTRACTOR_VERSION, RenderedPage
 from tests._openai_mocks import make_client, make_completion
 
 
@@ -69,7 +69,7 @@ async def test_poll_ingests_per_slug(db_session: AsyncSession, tmp_path: Path):
 
     facts = (await db_session.execute(select(AtomicFact))).scalars().all()
     assert len(facts) == 1
-    assert facts[0].extractor_version == "pdf-vision-v2"
+    assert facts[0].extractor_version == EXTRACTOR_VERSION
     assert facts[0].node_id is None
 
 

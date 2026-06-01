@@ -90,8 +90,6 @@ def jaccard(a: frozenset[str], b: frozenset[str]) -> float:
     if not a and not b:
         return 1.0
     union = a | b
-    if not union:
-        return 1.0
     return len(a & b) / len(union)
 
 
@@ -132,6 +130,21 @@ def regression_blocks_pivot(
     """
     mean_delta = candidate.mean_jaccard - baseline.mean_jaccard
     set_delta = candidate.set_equality_rate - baseline.set_equality_rate
+
+    # Fail closed on incomparable samples — deltas over different case counts
+    # don't mean anything, so never let a mismatch pass the gate.
+    if baseline.n_cases != candidate.n_cases:
+        return EvalReport(
+            baseline=baseline,
+            candidate=candidate,
+            mean_jaccard_delta=mean_delta,
+            set_equality_delta=set_delta,
+            blocks_pivot=True,
+            reason=(
+                f"n_cases mismatch: baseline={baseline.n_cases}, "
+                f"candidate={candidate.n_cases}"
+            ),
+        )
 
     reasons: list[str] = []
     if mean_delta < -mean_jaccard_tolerance:

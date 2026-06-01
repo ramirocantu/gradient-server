@@ -48,6 +48,7 @@ mise.*.local.toml
 *.swp
 *.swo
 Thumbs.db
+SPEC.md
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 postgres-data/

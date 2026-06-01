@@ -57,7 +57,12 @@ async def _capture_transcriptions(pdf_path: Path, *, client: Any) -> list[dict[s
 
 def _load_transcriptions(path: Path) -> list[tuple[int, str]]:
     raw = json.loads(path.read_text())
-    return [(int(r["page"]), str(r["text"])) for r in raw if str(r.get("text", "")).strip()]
+    rows = [
+        (int(r["page"]), str(r["text"]))
+        for r in raw
+        if str(r.get("text", "")).strip()
+    ]
+    return sorted(rows, key=lambda x: x[0])
 
 
 async def _extract_document(

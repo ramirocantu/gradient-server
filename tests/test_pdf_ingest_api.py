@@ -16,6 +16,7 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.outline import Course
+from app.services.kb.pdf_ingest import EXTRACTOR_VERSION
 from tests._openai_mocks import make_client, make_completion
 
 _TOKEN = {"X-Coach-Token": "change_me_before_use"}
@@ -64,7 +65,7 @@ async def test_pdf_ingest_happy_path(client: AsyncClient, db_session: AsyncSessi
     assert body["pages"] == 1
     assert body["new_facts"] == 1
     assert body["reused_pdf"] is False
-    assert body["extractor_version"] == "pdf-vision-v2"
+    assert body["extractor_version"] == EXTRACTOR_VERSION
 
 
 async def test_pdf_ingest_unknown_course_404(client: AsyncClient):
