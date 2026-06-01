@@ -26,6 +26,7 @@ from app.models.atomic_fact import AtomicFact
 from app.models.outline import Course
 from app.models.pdf_source import PdfSource
 from app.services.kb.pdf_ingest import (
+    _EXTRACT_MAX_DOC_CHARS,
     EXTRACTOR_VERSION,
     FactExtraction,
     IngestReport,
@@ -57,8 +58,16 @@ def _forge_renderer(pages: list[RenderedPage]):
 
 
 def _facts_completion(*facts: str, **kw):
-    """A structured-output completion whose JSON body lists ``facts``."""
-    body = json.dumps({"facts": [{"text": f} for f in facts]})
+    """A structured-output completion whose JSON body lists ``facts``; every
+    fact defaults to ``kind='concept'`` (the kept kind, V-KB7)."""
+    body = json.dumps({"facts": [{"text": f, "kind": "concept"} for f in facts]})
+    return make_completion(content=body, **kw)
+
+
+def _facts_completion_kinds(pairs: list[tuple[str, str]], **kw):
+    """A completion with explicit ``(text, kind)`` pairs — for mixed
+    concept/context discernment-gate tests (V-KB7)."""
+    body = json.dumps({"facts": [{"text": t, "kind": k} for t, k in pairs]})
     return make_completion(content=body, **kw)
 
 
@@ -89,7 +98,27 @@ async def test_extract_atomic_facts_parses_structured_output():
     client = make_client(_facts_completion("Fact one is here.", "Fact two is here."))
     out = await extract_atomic_facts("some page text", client=client, model="gpt-4.1-mini")
     assert isinstance(out, FactExtraction)
-    assert out.facts == ["Fact one is here.", "Fact two is here."]
+    assert out.facts == [("Fact one is here.", "concept"), ("Fact two is here.", "concept")]
+
+
+async def test_extract_atomic_facts_carries_kind():
+    """V-KB7: each fact carries its concept/context discernment kind."""
+    client = make_client(
+        _facts_completion_kinds([("A durable fact.", "concept"), ("An example setup.", "context")])
+    )
+    out = await extract_atomic_facts("text", client=client, model="gpt-4.1-mini")
+    assert out.facts == [("A durable fact.", "concept"), ("An example setup.", "context")]
+
+
+async def test_extract_defaults_malformed_kind_to_concept():
+    """V-KB7: a missing/invalid kind defaults to 'concept' — never silently
+    dropped because the discriminator field was malformed."""
+    body = json.dumps(
+        {"facts": [{"text": "No kind field."}, {"text": "Bad kind.", "kind": "bogus"}]}
+    )
+    client = make_client(make_completion(content=body))
+    out = await extract_atomic_facts("text", client=client, model="gpt-4.1-mini")
+    assert out.facts == [("No kind field.", "concept"), ("Bad kind.", "concept")]
 
 
 async def test_vision_and_extract_forward_service_tier():
@@ -113,10 +142,12 @@ async def test_extract_atomic_facts_blank_text_skips_llm_call():
 
 
 async def test_extract_atomic_facts_drops_empty_and_nonstring():
-    body = json.dumps({"facts": [{"text": "  Kept fact.  "}, {"text": "   "}, {"text": 5}]})
+    body = json.dumps(
+        {"facts": [{"text": "  Kept fact.  ", "kind": "concept"}, {"text": "   "}, {"text": 5}]}
+    )
     client = make_client(make_completion(content=body))
     out = await extract_atomic_facts("text", client=client, model="gpt-4.1-mini")
-    assert out.facts == ["Kept fact."]
+    assert out.facts == [("Kept fact.", "concept")]
 
 
 # --------------------------------------------------------------------------- #
@@ -133,7 +164,8 @@ async def test_first_ingest_renders_transcribes_extracts(db_session: AsyncSessio
     renderer = _forge_renderer(
         [RenderedPage(page=1, image_png=b"png-1"), RenderedPage(page=2, image_png=b"png-2")]
     )
-    # Two pages → two vision calls (transcription) + two extraction calls.
+    # Two pages → two vision calls (transcription) + ONE document-level
+    # extraction call (V-KB5: page transcriptions concat into one chunk).
     vision_client = make_client(
         make_completion(content="page one text", prompt_tokens=1000, completion_tokens=100),
         make_completion(content="page two text", prompt_tokens=1000, completion_tokens=100),
@@ -142,14 +174,10 @@ async def test_first_ingest_renders_transcribes_extracts(db_session: AsyncSessio
         _facts_completion(
             "Glycolysis converts glucose to pyruvate.",
             "It yields net two ATP per glucose.",
-            prompt_tokens=500,
-            completion_tokens=80,
-            cached_tokens=10,
-        ),
-        _facts_completion(
             "The TCA cycle regenerates oxaloacetate.",
             prompt_tokens=500,
             completion_tokens=80,
+            cached_tokens=10,
         ),
     )
 
@@ -167,10 +195,14 @@ async def test_first_ingest_renders_transcribes_extracts(db_session: AsyncSessio
     assert report.pages == 2
     assert report.new_facts == 3
     assert report.dup_facts == 0
+    assert report.dropped_context_facts == 0
     assert report.extractor_version == EXTRACTOR_VERSION
-    # V-L1: tokens summed across all 4 calls (vision 2×1000 + extract 2×500).
-    assert report.input_tokens == 3000
-    assert report.output_tokens == 360
+    # V-KB5: vision is per-page (2 calls); extraction is document-level (1 call).
+    assert vision_client.chat.completions.create.await_count == 2
+    assert extract_client.chat.completions.create.await_count == 1
+    # V-L1: tokens summed across all 3 calls (vision 2×1000 + extract 1×500).
+    assert report.input_tokens == 2500
+    assert report.output_tokens == 280
     assert report.cached_tokens == 10
 
     pdf_row = (
@@ -190,10 +222,90 @@ async def test_first_ingest_renders_transcribes_extracts(db_session: AsyncSessio
         .all()
     )
     assert len(facts) == 3
-    assert {f.page for f in facts} == {1, 2}
+    # V-KB5: both pages concat into one chunk → stamped with the chunk lead page.
+    assert {f.page for f in facts} == {1}
     # V-KB4: node_id NULL until the categorizer (T50) runs; V-KB3: version stamped.
     assert all(f.node_id is None for f in facts)
     assert all(f.extractor_version == EXTRACTOR_VERSION for f in facts)
+
+
+async def test_context_kind_dropped_at_persist(db_session: AsyncSession, tmp_path: Path):
+    """V-KB7: facts the model flags 'context' are dropped before persist and
+    counted in ``dropped_context_facts``; only 'concept' rows land in the DB."""
+    course = await _make_course(db_session)
+    course_id = course.id
+    pdf = tmp_path / "mixed.pdf"
+    _fake_pdf(pdf, b"%PDF-1.4 mixed")
+    renderer = _forge_renderer([RenderedPage(page=1, image_png=b"png-1")])
+
+    report = await ingest_pdf(
+        db_session,
+        course_id=course_id,
+        path=pdf,
+        vision_client=make_client(make_completion(content="page text")),
+        extract_client=make_client(
+            _facts_completion_kinds(
+                [
+                    ("Force equals mass times acceleration.", "concept"),
+                    ("Kinetic energy is one half m v squared.", "concept"),
+                    ("The page provides an example with V0 = 50 m/s.", "context"),
+                ]
+            )
+        ),
+        renderer=renderer,
+    )
+
+    assert report.new_facts == 2
+    assert report.dropped_context_facts == 1
+    assert report.dup_facts == 0
+
+    rows = (
+        (
+            await db_session.execute(
+                select(AtomicFact).where(AtomicFact.pdf_source_id == report.pdf_source_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2
+    texts = {r.text for r in rows}
+    assert "The page provides an example with V0 = 50 m/s." not in texts
+
+
+async def test_extraction_chunks_large_document(db_session: AsyncSession, tmp_path: Path):
+    """V-KB5: when concatenated transcriptions exceed the char ceiling, extraction
+    splits on page boundaries — more than one extract call, results unioned."""
+    course = await _make_course(db_session)
+    course_id = course.id
+    pdf = tmp_path / "big.pdf"
+    _fake_pdf(pdf, b"%PDF-1.4 big")
+    renderer = _forge_renderer(
+        [RenderedPage(page=1, image_png=b"png-1"), RenderedPage(page=2, image_png=b"png-2")]
+    )
+    # Each page transcription alone is under the ceiling, but the two together
+    # exceed it → two chunks → two extraction calls.
+    big_text = "x" * (_EXTRACT_MAX_DOC_CHARS - 100)
+    vision_client = make_client(
+        make_completion(content=big_text),
+        make_completion(content=big_text),
+    )
+    extract_client = make_client(
+        _facts_completion("Fact from chunk one."),
+        _facts_completion("Fact from chunk two."),
+    )
+
+    report = await ingest_pdf(
+        db_session,
+        course_id=course_id,
+        path=pdf,
+        vision_client=vision_client,
+        extract_client=extract_client,
+        renderer=renderer,
+    )
+
+    assert extract_client.chat.completions.create.await_count == 2
+    assert report.new_facts == 2
 
 
 async def test_re_ingest_same_file_is_noop(db_session: AsyncSession, tmp_path: Path):

@@ -206,7 +206,9 @@ def test_scheduler_feature_extraction_absent():
         "app.services.recommender",
         "app.services.topic_subtree",
         "app.services.analyzer",
-        "app.services.eval",
+        # NOTE: app.services.eval was deleted in T53 (legacy MCAT eval) but
+        # revived for RCA-11 as the extraction-quality measurement harness
+        # (V-L2). It is a live package again — no longer a fenced surface.
         "app.services.categorizer",
         "app.services.llm.batch",
         "app.api.v1.analyzer",

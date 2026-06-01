@@ -41,27 +41,63 @@ _logger = logging.getLogger("app.services.kb.pdf_ingest")
 # Bump when the vision prompt / extraction schema changes meaningfully.
 # Stamped onto every persisted fact (V-KB3) so a re-run under a new version
 # is a clean miss once content_hash dedup is keyed differently downstream.
-EXTRACTOR_VERSION = "pdf-vision-v1"
+# v2 (RCA-11): document-level learning-goals synthesis + concept/context
+# discernment gate + enriched vision (figure semantics).
+EXTRACTOR_VERSION = "pdf-vision-v2"
 
 _RENDER_DPI = 150
 _VISION_MAX_TOKENS = 4096
-_EXTRACT_MAX_TOKENS = 2048
+# Doc-level extraction (V-KB5): one call now covers the whole document, so the
+# output budget is larger than the old per-page cap.
+_EXTRACT_MAX_TOKENS = 3072
+# Concat-doc char ceiling before we split extraction on page boundaries (V-KB5).
+# Keeps a multi-page document inside nano's context with room for the 3072 output.
+_EXTRACT_MAX_DOC_CHARS = 48_000
 
 _VISION_SYSTEM = (
     "You transcribe a single page from a student's lecture notes or slide deck. "
     "The page may be typed, a slide image, or handwritten. Output the full "
     "readable text content of the page, faithfully and verbatim where legible. "
-    "Transcribe handwriting as best you can. Do NOT summarize, interpret, or add "
-    "commentary — emit only the page's own text. If the page has no legible text, "
-    "output nothing."
+    "Transcribe handwriting as best you can.\n"
+    "In ADDITION to the text, when the page contains a diagram, figure, graph, "
+    "chart, or table whose meaning is not fully captured by its text, emit a "
+    "brief factual description of it on its own line, prefixed `[figure]` "
+    "(e.g. `[figure] free-body diagram: block on an incline, friction vector "
+    "down-slope, gravity decomposed into components`). Describe only what is "
+    "shown — labels, relationships, quantities, structure. Do NOT add outside "
+    "knowledge, commentary, or interpretation beyond the visual. If the page has "
+    "no legible text and no informative figure, output nothing."
 )
 
 _EXTRACT_SYSTEM = (
-    "You extract atomic factual claims from a page of study material. "
-    "Each fact must be a single, self-contained, standalone statement that makes "
-    "sense without the surrounding text. Split compound sentences into separate "
-    "facts. Drop slide titles, page numbers, headers, and noise. Ground every "
-    "fact strictly in the provided text — do NOT invent or infer beyond it."
+    "You are given the full transcribed text of ONE study document (lecture notes "
+    "or a slide deck), with `=== page N ===` markers between pages. Produce the set "
+    "of atomic declarative facts a student is expected to LEARN from it.\n"
+    "\n"
+    "First, internally consider the document's learning goals: what key concepts, "
+    "definitions, principles, mechanisms, relationships, and quantitative laws "
+    "should a student understand after studying it? Then emit atomic facts that "
+    "COVER those goals.\n"
+    "\n"
+    "Each fact must be ONE self-contained declarative statement, true on its own "
+    "without the surrounding text. You MAY synthesize or restate a fact into clean "
+    "standalone form even when the document never phrases it as a single sentence "
+    "(summarization is allowed) — but stay grounded in the document's content and "
+    "do NOT introduce outside facts.\n"
+    "\n"
+    "Classify each fact with `kind`:\n"
+    "- `concept` — a durable, study-worthy declarative fact (definition, principle, "
+    "mechanism, relationship, quantitative law). This is the ONLY kind that is kept.\n"
+    "- `context` — describes a worked example, an example/practice-question setup, "
+    "what a problem asks, or one specific figure/diagram instance. Mark these "
+    "`context`, NOT `concept`.\n"
+    "\n"
+    "Do NOT emit at all (not even as context): slide titles, page numbers, headers, "
+    "author/course/date lines, and meta-statements about \"the text\", \"this page\", "
+    "\"the slide\", \"the diagram\", or \"the example below\".\n"
+    "\n"
+    "You produce declarative statements only. You must NEVER write a question, a "
+    "prompt, a flashcard, or any active-recall item — statements of fact only."
 )
 
 
@@ -84,9 +120,14 @@ class PageTranscription:
     cached_tokens: int = 0
 
 
+# A parsed fact: its text plus its discernment kind ('concept' kept, 'context'
+# dropped at persist per V-KB7).
+ParsedFact = tuple[str, str]
+
+
 @dataclass
 class FactExtraction:
-    facts: list[str] = field(default_factory=list)
+    facts: list[ParsedFact] = field(default_factory=list)
     prompt_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
@@ -100,6 +141,9 @@ class IngestReport:
     pages: int
     reused_pdf: bool
     extractor_version: str = EXTRACTOR_VERSION
+    # V-KB7: example/lecture-context facts the model flagged 'context' and we
+    # dropped before persist.
+    dropped_context_facts: int = 0
     # V-L1: token accounting summed across every vision + extraction call.
     input_tokens: int = 0
     output_tokens: int = 0
@@ -219,7 +263,7 @@ _EXTRACT_SCHEMA: dict[str, Any] = {
     "type": "json_schema",
     "json_schema": {
         "name": "extract_atomic_facts",
-        "description": "Atomic factual claims grounded in the page text.",
+        "description": "Atomic declarative facts grounded in the document text.",
         "strict": True,
         "schema": {
             "type": "object",
@@ -230,12 +274,20 @@ _EXTRACT_SCHEMA: dict[str, Any] = {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "required": ["text"],
+                        "required": ["text", "kind"],
                         "additionalProperties": False,
                         "properties": {
                             "text": {
                                 "type": "string",
-                                "description": "One self-contained atomic claim.",
+                                "description": "One self-contained atomic declarative claim.",
+                            },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["concept", "context"],
+                                "description": (
+                                    "concept = durable study-worthy fact (kept); "
+                                    "context = example/figure/problem prose (dropped)."
+                                ),
                             },
                         },
                     },
@@ -246,8 +298,8 @@ _EXTRACT_SCHEMA: dict[str, Any] = {
 }
 
 
-def _parse_facts(payload: dict[str, Any]) -> list[str]:
-    out: list[str] = []
+def _parse_facts(payload: dict[str, Any]) -> list[ParsedFact]:
+    out: list[ParsedFact] = []
     for raw in payload.get("facts") or []:
         if not isinstance(raw, dict):
             continue
@@ -255,8 +307,14 @@ def _parse_facts(payload: dict[str, Any]) -> list[str]:
         if not isinstance(text, str):
             continue
         text = text.strip()
-        if text:
-            out.append(text)
+        if not text:
+            continue
+        # V-KB7: default to 'concept' on a missing/invalid kind — never silently
+        # drop a fact because the discriminator field was malformed.
+        kind = raw.get("kind")
+        if kind not in ("concept", "context"):
+            kind = "concept"
+        out.append((text, kind))
     return out
 
 
@@ -268,10 +326,11 @@ async def extract_atomic_facts(
     max_tokens: int = _EXTRACT_MAX_TOKENS,
     service_tier: str | None = None,
 ) -> FactExtraction:
-    """One OpenAI structured-output call: page text → atomic facts (V-KB4).
+    """One OpenAI structured-output call: document text → atomic facts (V-KB4).
 
-    Empty/blank input → no LLM call, empty result. Strict json_schema emits the
-    document in ``choice.message.content`` (mirrors ``llm/grounded.py``).
+    ``text`` is the full document (page transcriptions concatenated, V-KB5), not a
+    single page. Empty/blank input → no LLM call, empty result. Strict json_schema
+    emits the document in ``choice.message.content`` (mirrors ``llm/grounded.py``).
     ``service_tier`` (e.g. ``'flex'``, V-L5) is forwarded when set."""
 
     if not text.strip():
@@ -292,7 +351,7 @@ async def extract_atomic_facts(
     prompt_tokens, output_tokens, cached_tokens = _read_usage(completion)
 
     content = _message_content(completion)
-    facts: list[str] = []
+    facts: list[ParsedFact] = []
     if content:
         try:
             facts = _parse_facts(json.loads(content))
@@ -309,6 +368,42 @@ async def extract_atomic_facts(
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
+
+
+def _format_page(page: int, text: str) -> str:
+    return f"=== page {page} ===\n{text}"
+
+
+def _chunk_document(
+    transcribed: list[tuple[int, str]],
+    *,
+    max_chars: int = _EXTRACT_MAX_DOC_CHARS,
+) -> list[tuple[int, str]]:
+    """Group page transcriptions into document chunks for extraction (V-KB5).
+
+    Pages are concatenated with ``=== page N ===`` markers into as few chunks as
+    fit under ``max_chars``; splits fall only on page boundaries. Each chunk is
+    returned with its lead (first) page, used to stamp ``AtomicFact.page``. A
+    single page longer than ``max_chars`` becomes its own chunk (never split
+    mid-page). Empty input → no chunks (no extraction call)."""
+
+    chunks: list[tuple[int, str]] = []
+    cur: list[str] = []
+    cur_lead = 0
+    cur_len = 0
+    for page, text in transcribed:
+        block = _format_page(page, text)
+        sep = 2 if cur else 0  # cost of the '\n\n' join
+        if cur and cur_len + sep + len(block) > max_chars:
+            chunks.append((cur_lead, "\n\n".join(cur)))
+            cur, cur_lead, cur_len, sep = [], 0, 0, 0
+        if not cur:
+            cur_lead = page
+        cur.append(block)
+        cur_len += sep + len(block)
+    if cur:
+        chunks.append((cur_lead, "\n\n".join(cur)))
+    return chunks
 
 
 def _sha256_file(path: Path) -> str:
@@ -382,11 +477,14 @@ async def ingest_pdf(
     pages = renderer(path)
     new_facts = 0
     dup_facts = 0
+    dropped_context = 0
     in_tokens = 0
     out_tokens = 0
     cached = 0
     seen_hashes: set[str] = set()
 
+    # Pass 1 — transcribe every page (vision is inherently per-image, V-KB8).
+    transcribed: list[tuple[int, str]] = []
     for rendered in pages:
         transcription = await transcribe_page(
             rendered.image_png,
@@ -397,9 +495,14 @@ async def ingest_pdf(
         in_tokens += transcription.prompt_tokens
         out_tokens += transcription.output_tokens
         cached += transcription.cached_tokens
+        if transcription.text:
+            transcribed.append((rendered.page, transcription.text))
 
+    # Pass 2 — document-level extraction (V-KB5): concat page transcriptions and
+    # run one extraction per chunk so the model sees the whole learning arc.
+    for chunk_lead_page, chunk_text in _chunk_document(transcribed):
         extraction = await extract_atomic_facts(
-            transcription.text,
+            chunk_text,
             client=extract_client,
             model=resolved_extract_model,
             service_tier=service_tier,
@@ -408,7 +511,12 @@ async def ingest_pdf(
         out_tokens += extraction.output_tokens
         cached += extraction.cached_tokens
 
-        for fact_text in extraction.facts:
+        for fact_text, kind in extraction.facts:
+            # V-KB7: discernment gate — only durable 'concept' facts persist;
+            # 'context' (example/figure/problem prose) is dropped and counted.
+            if kind != "concept":
+                dropped_context += 1
+                continue
             content_hash = _sha256_text(fact_text)
             if content_hash in seen_hashes:
                 dup_facts += 1
@@ -429,7 +537,7 @@ async def ingest_pdf(
                 AtomicFact(
                     course_id=course_id,
                     pdf_source_id=pdf_id,
-                    page=rendered.page,
+                    page=chunk_lead_page,
                     text=fact_text,
                     content_hash=content_hash,
                     extractor_version=extractor_version,
@@ -443,12 +551,13 @@ async def ingest_pdf(
     await session.flush()
 
     _logger.info(
-        "pdf_ingest: pdf=%d pages=%d new_facts=%d dup_facts=%d "
+        "pdf_ingest: pdf=%d pages=%d new_facts=%d dup_facts=%d dropped_context=%d "
         "vision_model=%s extract_model=%s prompt=%d cached=%d out=%d version=%s",
         pdf_id,
         len(pages),
         new_facts,
         dup_facts,
+        dropped_context,
         resolved_vision_model,
         resolved_extract_model,
         in_tokens,
@@ -464,6 +573,7 @@ async def ingest_pdf(
         pages=len(pages),
         reused_pdf=False,
         extractor_version=extractor_version,
+        dropped_context_facts=dropped_context,
         input_tokens=in_tokens,
         output_tokens=out_tokens,
         cached_tokens=cached,
